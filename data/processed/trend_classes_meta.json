@@ -1,0 +1,18 @@
+{
+  "input": "trends_full.parquet",
+  "output": "trend_classes.parquet",
+  "freq_window": 6,
+  "min_periods": 8,
+  "thresholds": {
+    "vol_p70": 0.00010381255792927044,
+    "vol_p30": 6.846047954227283e-05,
+    "growth_p70": 0.08061374703383152,
+    "growth_p30": -0.13751211852662437
+  },
+  "counts": {
+    "neutra": 6116,
+    "declive": 4150,
+    "consolidada": 3541,
+    "emergente": 2902
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "dataset": "MIT AI News",
+  "file": "mit_ai_news.csv",
+  "rows_input": 1018,
+  "rows_output": 1016,
+  "columns_input": [
+    "Unnamed: 0",
+    "Published Date",
+    "Author",
+    "Source",
+    "Article Header",
+    "Sub_Headings",
+    "Article Body",
+    "Url"
+  ],
+  "selected": {
+    "date_col": "Published Date",
+    "title_col": "Article Header",
+    "text_col": "Article Body",
+    "combined_title_body": true
+  },
+  "quality": {
+    "null_date_rate_output": 0.0,
+    "min_text_len": 20
+  },
+  "date_range": {
+    "min": "1994-03-16 00:00:00",
+    "max": "2023-07-07 00:00:00"
+  }
+}

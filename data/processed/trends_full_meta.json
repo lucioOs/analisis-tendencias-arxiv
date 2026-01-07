@@ -1,0 +1,11 @@
+{
+  "freq": "M",
+  "min_df": 3,
+  "ngram_max": 2,
+  "input": "clean.parquet",
+  "output": "trends_full.parquet",
+  "n_terms": 54078,
+  "n_rows": 543161,
+  "period_min": "1994-03-01 00:00:00",
+  "period_max": "2023-07-01 00:00:00"
+}
