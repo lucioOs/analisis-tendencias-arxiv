@@ -1,28 +1,28 @@
 # app/streamlit_app.py
-# Dashboard de Tendencias (PLN + ML)
-# - Modo Historico (MIT): tendencias completas (emergente/consolidada/declive)
-# - Modo Live (RSS + arXiv): si hay historia suficiente, calcula tendencias; si no, muestra actividad (siempre muestra algo)
-#
-# Requisitos esperados en data/processed:
-# - dataset.parquet (historico MIT)
-# - trends_full.parquet / trend_classes.parquet (si ya corriste pipeline historico)
-# - live_dataset.parquet (si ya corriste export_live_dataset.py)
-#
-# Este archivo esta pensado para ser robusto: valida entradas, maneja faltantes y evita pantallas vacias.
+# Dashboard de Tendencias (PLN + ML) - Versión final robusta (con optimizaciones de memoria)
+# Incluye:
+# - Histórico (MIT): tendencias por clase + serie temporal
+# - Live (arXiv/RSS): actualización + fallback (actividad) + clasificación heurística
+# - N-grams, WordCloud, KPIs, tablas
+# - Optimización: cierre de figuras, caching con TTL, límites de datos para evitar consumo de RAM
 
 from __future__ import annotations
 
 import os
+import sys
 import time
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Tuple, List, Optional
 
+import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 
-from sklearn.feature_extraction.text import TfidfVectorizer
+from wordcloud import WordCloud
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 
 
 # -----------------------------
@@ -37,24 +37,27 @@ LIVE_DATASET = PROCESSED / "live_dataset.parquet"
 TRENDS_FULL = PROCESSED / "trends_full.parquet"
 TREND_CLASSES = PROCESSED / "trend_classes.parquet"
 
-# Si tienes un runner live, cambia a la ruta correcta. Si no existe, el boton solo refresca la pagina.
-LIVE_RUNNER = ROOT / "src" / "live_runner.py"  # opcional
-EXPORT_LIVE = ROOT / "src" / "export_live_dataset.py"  # opcional
+EXPORT_LIVE = ROOT / "src" / "export_live_dataset.py"
 
-APP_TITLE = "Sistema de Analisis y Prediccion de Tendencias (PLN + ML)"
+APP_TITLE = "Sistema de Análisis y Predicción de Tendencias (PLN + ML)"
 
 
 # -----------------------------
-# Utilidades (logs, safe I/O)
+# Parámetros de performance / memoria (ajustables)
 # -----------------------------
-def _safe_text(s: str) -> str:
-    return s.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+CACHE_TTL_SEC = 300              # 5 min: evita cache indefinido en sesiones largas
+MAX_LIVE_ROWS = 3000             # límite de filas usadas en cálculos Live
+MAX_WC_DOCS = 250                # máximo de documentos para WordCloud
+MAX_RECENT_ROWS = 40             # tabla de recientes
+TOPK_ACTIVITY_TERMS = 40         # top términos en actividad
+TOPK_CANDIDATES = 60             # candidatos TF-IDF para series/heurística
+MAX_FEATURES_ACTIVITY = 4000     # vocabulario TF-IDF para actividad
+MAX_FEATURES_TRENDS = 1500       # vocabulario TF-IDF para tendencias
 
 
-def log_info(msg: str) -> None:
-    st.caption(_safe_text(msg))
-
-
+# -----------------------------
+# Utilidades (safe I/O, procesos)
+# -----------------------------
 def file_exists(path: Path) -> bool:
     try:
         return path.exists() and path.is_file()
@@ -62,64 +65,83 @@ def file_exists(path: Path) -> bool:
         return False
 
 
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
+def read_parquet_cached(path_str: str) -> pd.DataFrame:
+    path = Path(path_str)
+    if not file_exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
 def read_parquet_safe(path: Path) -> pd.DataFrame:
     try:
-        if not file_exists(path):
-            return pd.DataFrame()
-        return pd.read_parquet(path)
+        return read_parquet_cached(str(path))
     except Exception as e:
-        st.error(f"No se pudo leer {path}: {e}")
+        st.error(f"Error al leer {path.name}: {e}")
         return pd.DataFrame()
 
 
-def normalize_base(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza una base para tener al menos: date, text, source.
-    Si no existen, intenta inferir. Si no se puede, regresa df vacio.
-    """
+def run_script_capture(args: List[str], timeout_sec: int = 240) -> Tuple[int, str]:
+    try:
+        p = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+        )
+        out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
+        return p.returncode, out.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "Tiempo de espera excedido."
+    except Exception as e:
+        return 1, f"Excepción: {e}"
+
+
+# -----------------------------
+# Normalización de datos
+# -----------------------------
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
+def normalize_base_cached(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
     cols = {c.lower(): c for c in df.columns}
 
-    # Fecha
-    date_col = None
-    for k in ["date", "published", "published_at", "created", "updated", "time", "datetime"]:
-        if k in cols:
-            date_col = cols[k]
-            break
-
-    # Texto
-    text_col = None
-    for k in ["text", "content", "summary", "abstract", "body", "article_body", "article", "description"]:
-        if k in cols:
-            text_col = cols[k]
-            break
-
-    # Fuente
-    source_col = None
-    for k in ["source", "origin", "provider"]:
-        if k in cols:
-            source_col = cols[k]
-            break
+    date_col = next((cols[k] for k in ["date", "published", "published_at", "created", "published date"] if k in cols), None)
+    text_col = next((cols[k] for k in ["text", "content", "summary", "abstract", "title", "article body", "article header"] if k in cols), None)
+    source_col = next((cols[k] for k in ["source", "origin"] if k in cols), None)
 
     if date_col is None or text_col is None:
         return pd.DataFrame()
 
     out = pd.DataFrame()
+    # Parse tolerante de fechas; utc=True solo si vienes de feeds con tz
     out["date"] = pd.to_datetime(df[date_col], errors="coerce", utc=True).dt.tz_convert(None)
     out["text"] = df[text_col].astype(str)
 
-    if source_col is not None:
+    if source_col:
         out["source"] = df[source_col].astype(str)
     else:
         out["source"] = "unknown"
+
+    # reduce memoria en source
+    out["source"] = out["source"].astype("category")
 
     out["text"] = out["text"].str.replace(r"\s+", " ", regex=True).str.strip()
     out = out.dropna(subset=["date", "text"])
     out = out[out["text"].str.len() >= 20]
     out = out.sort_values("date").reset_index(drop=True)
     return out
+
+
+def normalize_base(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        return normalize_base_cached(df)
+    except Exception:
+        # fallback sin cache si streamlit no puede hashear el DF en algún entorno
+        return normalize_base_cached.clear() or pd.DataFrame()
 
 
 def period_count(df: pd.DataFrame, freq: str) -> int:
@@ -135,35 +157,53 @@ def date_range_str(df: pd.DataFrame) -> str:
     if df.empty:
         return "-"
     try:
-        return f"{df['date'].min()} -> {df['date'].max()}"
+        return f"{df['date'].min().date()} -> {df['date'].max().date()}"
     except Exception:
         return "-"
 
 
-def run_script_capture(args: list[str], timeout_sec: int = 120) -> Tuple[int, str]:
-    """
-    Ejecuta un script y regresa (returncode, stdout+stderr).
-    Maneja encoding para Windows.
-    """
-    try:
-        p = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_sec,
-        )
-        out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
-        return p.returncode, out.strip()
-    except subprocess.TimeoutExpired:
-        return 124, "Tiempo de espera excedido al ejecutar el proceso."
-    except Exception as e:
-        return 1, f"Fallo al ejecutar proceso: {e}"
+def limit_live_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    # limitar para estabilidad si la app corre horas
+    df = df.sort_values("date").tail(MAX_LIVE_ROWS).copy()
+    return df
 
 
 # -----------------------------
-# Tendencias / Actividad (Live fallback)
+# WordCloud (optimizado)
+# -----------------------------
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
+def join_text_for_wc(texts: List[str]) -> str:
+    # Cachea la concatenación para evitar recomputar en reruns
+    return " ".join(texts)
+
+
+def plot_wordcloud_from_text(text: str) -> Optional[plt.Figure]:
+    if not text or len(text.strip()) < 50:
+        return None
+    try:
+        wc = WordCloud(
+            width=900,
+            height=380,
+            background_color=None,
+            mode="RGBA",
+            colormap="viridis",
+            stopwords=ENGLISH_STOP_WORDS,
+            min_word_length=4,
+        ).generate(text)
+
+        fig, ax = plt.subplots(figsize=(11, 4))
+        ax.imshow(wc, interpolation="bilinear")
+        ax.axis("off")
+        fig.patch.set_alpha(0)
+        return fig
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Actividad Live (fallback)
 # -----------------------------
 @dataclass
 class LiveActivityResult:
@@ -172,490 +212,435 @@ class LiveActivityResult:
     recent_rows: pd.DataFrame
 
 
-def compute_live_activity(
-    df: pd.DataFrame,
-    ngram_max: int,
-    min_df: int,
-    top_k_terms: int = 40,
-    max_features: int = 4000,
-) -> LiveActivityResult:
-    """
-    Calcula "actividad" cuando no hay suficiente historia para tendencias:
-    - Top terminos por TF-IDF (suma de pesos)
-    - Actividad por dia (conteo de items)
-    - Tabla de articulos recientes
-    """
-    if df.empty:
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
+def compute_live_activity_cached(dfw: pd.DataFrame, ngram_max: int, min_df: int) -> LiveActivityResult:
+    if dfw.empty:
         return LiveActivityResult(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
-    # TF-IDF robusto para terminos
     vectorizer = TfidfVectorizer(
         lowercase=True,
-        stop_words=None,
-        max_features=max_features,
+        stop_words="english",
+        max_features=MAX_FEATURES_ACTIVITY,
         ngram_range=(1, max(1, int(ngram_max))),
         token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_\-]+\b",
         min_df=max(1, int(min_df)),
     )
 
-    X = vectorizer.fit_transform(df["text"].values)
-    terms = vectorizer.get_feature_names_out()
-    scores = X.sum(axis=0).A1
+    try:
+        X = vectorizer.fit_transform(dfw["text"].values)
+        terms = vectorizer.get_feature_names_out()
+        scores = X.sum(axis=0).A1
 
-    if len(scores) == 0:
-        top_terms = pd.DataFrame(columns=["term", "score"])
-    else:
-        idx = scores.argsort()[::-1][:top_k_terms]
+        idx = scores.argsort()[::-1][:TOPK_ACTIVITY_TERMS]
         top_terms = pd.DataFrame({"term": terms[idx], "score": scores[idx]})
+    except Exception:
+        top_terms = pd.DataFrame(columns=["term", "score"])
 
-    # Actividad por dia
-    tmp = df.copy()
+    tmp = dfw.copy()
     tmp["day"] = tmp["date"].dt.date
     activity = tmp.groupby("day", as_index=False).size().rename(columns={"size": "items"})
 
-    # Tabla de recientes
-    recent = df.sort_values("date", ascending=False).head(30).copy()
-    recent = recent[["date", "source", "text"]]
+    recent = dfw.sort_values("date", ascending=False).head(MAX_RECENT_ROWS)[["date", "source", "text"]]
+    recent["text"] = recent["text"].str.slice(0, 350)
 
     return LiveActivityResult(top_terms, activity, recent)
+
+
+def compute_live_activity(dfw: pd.DataFrame, ngram_max: int, min_df: int) -> LiveActivityResult:
+    return compute_live_activity_cached(dfw, int(ngram_max), int(min_df))
+
+
+# -----------------------------
+# Clasificación heurística Live
+# -----------------------------
+@dataclass
+class TrendRow:
+    term: str
+    slope: float
+    growth: float
+    stability: float
+    total: int
+    label: str
+
+
+def _safe_period_series(dfw: pd.DataFrame, freq: str) -> pd.Series:
+    return dfw["date"].dt.to_period(freq).astype(str)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
+def build_term_timeseries_cached(dfw: pd.DataFrame, freq: str, terms: Tuple[str, ...]) -> pd.DataFrame:
+    if dfw.empty or not terms:
+        return pd.DataFrame()
+
+    tmp = dfw[["date", "text"]].copy()
+    tmp["period"] = _safe_period_series(tmp, freq)
+    periods = sorted(tmp["period"].unique().tolist())
+    if not periods:
+        return pd.DataFrame()
+
+    mat = pd.DataFrame(index=periods)
+    text_series = tmp["text"]
+
+    for t in terms:
+        try:
+            mask = text_series.str.contains(t, case=False, na=False, regex=False)
+            counts = tmp.loc[mask].groupby("period").size()
+            mat[t] = counts.reindex(periods, fill_value=0)
+        except Exception:
+            mat[t] = 0
+
+    mat.index.name = "period"
+    return mat
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
+def classify_trends_from_matrix_cached(mat: pd.DataFrame) -> pd.DataFrame:
+    if mat.empty or mat.shape[0] < 2:
+        return pd.DataFrame()
+
+    x = np.arange(mat.shape[0], dtype=float)
+    vx = float(np.var(x))
+    if vx <= 0:
+        return pd.DataFrame()
+
+    rows: list[TrendRow] = []
+
+    for term in mat.columns:
+        y = mat[term].astype(float).values
+        total = int(y.sum())
+        if total <= 0:
+            continue
+
+        slope = float(np.cov(x, y, bias=True)[0, 1] / vx)
+
+        first = float(y[0])
+        last = float(y[-1])
+        growth = float((last - first) / (first + 1.0))
+
+        mean = float(np.mean(y))
+        std = float(np.std(y))
+        stability = float(max(0.0, 1.0 - (std / (mean + 1.0))))
+
+        label = "otro"
+        if slope > 0.25 and growth > 0.30:
+            label = "emergente"
+        elif slope < -0.25 and growth < -0.30:
+            label = "declive"
+        else:
+            label = "candidato_consolidada"
+
+        rows.append(TrendRow(term, slope, growth, stability, total, label))
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame([r.__dict__ for r in rows])
+
+    p70 = float(out["total"].quantile(0.70))
+    mask_cons = (
+        (out["label"] == "candidato_consolidada")
+        & (out["total"] >= p70)
+        & (out["stability"] >= 0.55)
+        & (out["slope"].abs() < 0.25)
+    )
+    out.loc[mask_cons, "label"] = "consolidada"
+    out.loc[out["label"] == "candidato_consolidada", "label"] = "otro"
+
+    out = out.sort_values(["label", "slope", "total"], ascending=[True, False, False]).reset_index(drop=True)
+    return out
 
 
 # -----------------------------
 # UI helpers
 # -----------------------------
-def apply_dark_css() -> None:
+def apply_custom_css():
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 2rem; padding-bottom: 2.5rem; }
-        h1, h2, h3 { letter-spacing: 0.2px; }
-        .stAlert { border-radius: 14px; }
-        div[data-testid="stMetric"] { background: rgba(255,255,255,0.04); padding: 10px 12px; border-radius: 14px; }
-        .stDataFrame { border-radius: 14px; overflow: hidden; }
+        .block-container { padding-top: 2rem; }
+        div[data-testid="stMetric"] {
+            background-color: #262730;
+            border: 1px solid #464b59;
+            padding: 10px;
+            border-radius: 8px;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def header() -> None:
-    st.title(APP_TITLE)
-    st.write("Modo historico (MIT) y modo Live (near real-time con arXiv/RSS, sin costo).")
-
-
-def quick_guide() -> None:
-    with st.expander("Guia rapida de interpretacion", expanded=False):
-        st.markdown(
-            """
-- **Historico (MIT)**: base amplia (1994-2023). Permite clasificar tendencias (emergente / consolidada / declive) con mayor estabilidad.
-- **Live (RSS + arXiv)**: datos recientes. Si aun no hay suficientes periodos temporales (semanas/meses), se muestra **actividad** (top terminos y articulos recientes).
-- La clasificacion de tendencia requiere **al menos 2 periodos** en la frecuencia seleccionada.
-            """.strip()
-        )
-
-
-def show_kpis(df: pd.DataFrame, label: str, freq: str) -> None:
+def show_kpis(df: pd.DataFrame, context_label: str, freq: str):
     c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric(f"Registros ({label})", f"{len(df):,}")
-    with c2:
-        st.metric("Rango de fechas", date_range_str(df))
-    with c3:
-        st.metric(f"Periodos ({freq})", f"{period_count(df, freq)}")
+    c1.metric("Total documentos", f"{len(df):,}")
+    c2.metric("Cobertura temporal", date_range_str(df))
+    c3.metric(f"Periodos ({freq})", f"{period_count(df, freq)}")
 
 
 # -----------------------------
-# Historico: lectura de tendencias
+# Vistas
 # -----------------------------
-def load_historic_tables() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df_trends = read_parquet_safe(TRENDS_FULL)
-    df_classes = read_parquet_safe(TREND_CLASSES)
-
-    # Normaliza nombres esperados si existen
-    # df_trends esperado: term, period, count, rel_freq
-    # df_classes esperado: term, class (emergente/consolidada/declive)
-    if not df_trends.empty:
-        cols = {c.lower(): c for c in df_trends.columns}
-        rename = {}
-        if "term" in cols and cols["term"] != "term":
-            rename[cols["term"]] = "term"
-        if "period" in cols and cols["period"] != "period":
-            rename[cols["period"]] = "period"
-        if "count" in cols and cols["count"] != "count":
-            rename[cols["count"]] = "count"
-        if "rel_freq" in cols and cols["rel_freq"] != "rel_freq":
-            rename[cols["rel_freq"]] = "rel_freq"
-        if rename:
-            df_trends = df_trends.rename(columns=rename)
-
-    if not df_classes.empty:
-        cols = {c.lower(): c for c in df_classes.columns}
-        rename = {}
-        if "term" in cols and cols["term"] != "term":
-            rename[cols["term"]] = "term"
-        if "class" in cols and cols["class"] != "class":
-            rename[cols["class"]] = "class"
-        if rename:
-            df_classes = df_classes.rename(columns=rename)
-
-    return df_trends, df_classes
-
-
-def historic_view() -> None:
-    st.subheader("Historico (MIT)")
+def historic_view():
+    st.subheader("Análisis histórico (MIT)")
+    st.caption("Análisis longitudinal para entrenamiento y validación de modelos.")
 
     df_base = normalize_base(read_parquet_safe(HIST_DATASET))
     if df_base.empty:
-        st.error(
-            f"No se encontro base historica en {HIST_DATASET}. "
-            "Ejecuta el pipeline historico primero (load_data, preprocess, trends, features, train)."
-        )
+        st.error("No se encontró la base histórica procesada (dataset.parquet).")
         return
 
-    # Mostrar KPIs de base
-    show_kpis(df_base, "Historico", "M")
+    show_kpis(df_base, "Histórico", "M")
 
-    df_trends, df_classes = load_historic_tables()
+    df_trends = read_parquet_safe(TRENDS_FULL)
+    df_classes = read_parquet_safe(TREND_CLASSES)
 
     if df_trends.empty or df_classes.empty:
-        st.warning(
-            "Faltan archivos de tendencias historicas (trends_full.parquet o trend_classes.parquet). "
-            "Puedes seguir viendo la base, pero no se mostrara clasificacion."
-        )
-        # Mostrar un resumen simple por anio/mes
-        tmp = df_base.copy()
-        tmp["month"] = tmp["date"].dt.to_period("M").astype(str)
-        counts = tmp.groupby("month", as_index=False).size().rename(columns={"size": "items"})
-        st.line_chart(counts.set_index("month")[["items"]], use_container_width=True)
-        st.dataframe(df_base.sort_values("date", ascending=False).head(30), use_container_width=True)
+        st.warning("Faltan archivos de tendencias (trends_full.parquet / trend_classes.parquet).")
+        st.dataframe(df_base.head(50), use_container_width=True)
         return
 
-    # Unir clases con tendencias
     df = df_trends.merge(df_classes, on="term", how="left")
     df["class"] = df["class"].fillna("sin_clase")
 
-    # Tabs por clase
-    classes_order = ["emergente", "consolidada", "declive", "sin_clase"]
-    tabs = st.tabs([c.capitalize() for c in classes_order])
+    st.divider()
+    classes_order = ["emergente", "consolidada", "declive"]
+    tabs = st.tabs(["Emergente", "Consolidada", "Declive"])
 
     for cls, tab in zip(classes_order, tabs):
         with tab:
-            sub = df[df["class"].str.lower() == cls].copy()
+            sub = df[df["class"] == cls].copy()
             if sub.empty:
-                st.info("No hay terminos en esta categoria.")
+                st.info(f"No hay tendencias clasificadas como {cls}.")
                 continue
 
-            term_list = (
-                sub.groupby("term", as_index=False)["count"].sum()
-                .sort_values("count", ascending=False)
-                .head(200)["term"]
-                .tolist()
+            top_terms = (
+                sub.groupby("term")["count"].sum()
+                .sort_values(ascending=False)
+                .head(150)
+                .index.tolist()
             )
-            term = st.selectbox("Selecciona un termino", term_list, key=f"hist_term_{cls}")
 
-            ts = sub[sub["term"] == term].copy()
-            if ts.empty:
-                st.info("No hay serie temporal para este termino.")
-                continue
+            col_sel, col_plot = st.columns([1, 2])
+            with col_sel:
+                selected_term = st.selectbox(f"Selecciona tendencia ({cls})", top_terms, key=f"hist_sel_{cls}")
 
-            # Grafica serie temporal
-            ts = ts.sort_values("period")
-            st.line_chart(ts.set_index("period")[["rel_freq"]], use_container_width=True)
+            ts = sub[sub["term"] == selected_term].sort_values("period")
+            with col_plot:
+                if "rel_freq" in ts.columns:
+                    st.line_chart(ts.set_index("period")["rel_freq"], use_container_width=True)
+                else:
+                    st.line_chart(ts.set_index("period")["count"], use_container_width=True)
 
-            c1, c2 = st.columns([1.2, 1])
-            with c1:
-                st.dataframe(ts[["period", "count", "rel_freq"]], use_container_width=True, height=360)
-            with c2:
-                st.write("Resumen")
-                st.metric("Total apariciones", f"{ts['count'].sum():,}")
-                st.metric("Promedio rel_freq", f"{ts['rel_freq'].mean():.6f}")
+            with st.expander("Ver datos"):
+                st.dataframe(ts, use_container_width=True)
 
 
-# -----------------------------
-# Live view
-# -----------------------------
-def live_controls() -> Dict[str, object]:
+def live_view():
+    st.subheader("Monitor Live (arXiv + RSS)")
+    st.caption("Modo Live. Si la historia es corta, se muestra actividad general.")
+
     with st.sidebar:
-        st.header("Live")
+        st.header("Configuración Live")
+        window_days = st.slider("Ventana (días)", 7, 365, 180)
+        freq = st.selectbox("Frecuencia", ["D", "W", "M"], index=1)
 
-        auto_refresh = st.selectbox("Auto-refresh (min)", [0, 1, 5, 10, 15], index=2)
-        do_update = st.button("Actualizar ahora", use_container_width=True)
+        st.divider()
+        st.subheader("Parámetros NLP")
+        ngram_max = st.selectbox("N-grams", [1, 2, 3], index=1)
+        min_df = st.number_input("min_df", 1, 10, 2)
 
-        st.caption("Auto-refresh recarga la vista. 'Actualizar ahora' ejecuta el export live (si existe).")
-
-    return {"auto_refresh": auto_refresh, "do_update": do_update}
-
-
-def maybe_autorefresh(minutes: int) -> None:
-    if minutes and minutes > 0:
-        # Streamlit no tiene auto-refresh nativo sin dependencias externas.
-        # Implementacion simple: usa query params con un contador para forzar rerun.
-        # Si esto te molesta, deja auto_refresh en 0.
-        now = int(time.time())
-        st.query_params["t"] = str(now)
-
-
-def run_live_update() -> None:
-    """
-    Intenta actualizar live:
-    - si existe src/export_live_dataset.py, lo ejecuta
-    - si no, solo avisa
-    """
-    if file_exists(EXPORT_LIVE):
-        st.info("Actualizando base Live...")
-        code, out = run_script_capture(["python", str(EXPORT_LIVE)], timeout_sec=180)
-        if code == 0:
-            st.success("Live actualizado. Recargando datos.")
-        else:
-            st.error("No se pudo actualizar Live.")
-            st.text(out[:4000])
-    elif file_exists(LIVE_RUNNER):
-        # fallback a live_runner si tu proyecto lo usa
-        st.info("Actualizando Live (runner)...")
-        code, out = run_script_capture(["python", str(LIVE_RUNNER)], timeout_sec=220)
-        if code == 0:
-            st.success("Live actualizado. Recargando datos.")
-        else:
-            st.error("No se pudo actualizar Live.")
-            st.text(out[:4000])
-    else:
-        st.warning("No hay script de actualizacion Live configurado. Se usaran los datos existentes.")
-
-
-def live_view() -> None:
-    st.subheader("Live (RSS + arXiv)")
+        if st.button("Actualizar ahora", type="primary"):
+            if not file_exists(EXPORT_LIVE):
+                st.error("No se encontró src/export_live_dataset.py")
+            else:
+                with st.spinner("Actualizando Live..."):
+                    code, out = run_script_capture([sys.executable, str(EXPORT_LIVE)], timeout_sec=300)
+                    if code == 0:
+                        st.success("Live actualizado.")
+                        time.sleep(0.8)
+                        st.rerun()
+                    else:
+                        st.error("Falló la actualización Live.")
+                        st.text(out[:4000])
 
     df_live = normalize_base(read_parquet_safe(LIVE_DATASET))
     if df_live.empty:
-        st.warning(
-            f"No se encontro {LIVE_DATASET}. Presiona 'Actualizar ahora' si tienes export_live_dataset.py, "
-            "o genera live_dataset.parquet desde tu pipeline."
-        )
+        st.warning("No hay datos Live. Presiona 'Actualizar ahora'.")
         return
 
-    # Controles de analisis live
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        window_days = st.slider("Ventana Live (dias)", min_value=30, max_value=365, value=365, step=5)
-    with c2:
-        freq = st.selectbox("Frecuencia", ["D", "W", "M"], index=1)
-    with c3:
-        min_df = st.slider("min_df", min_value=1, max_value=20, value=1, step=1)
-
-    ngram_max = st.selectbox("ngram_max", [1, 2], index=0)
-
-    # Filtrar ventana
     cutoff = df_live["date"].max() - pd.Timedelta(days=int(window_days))
     dfw = df_live[df_live["date"] >= cutoff].copy()
+
+    # Fallback si la ventana deja el conjunto vacío
     if dfw.empty:
-        st.info("No hay datos en la ventana seleccionada. Aumenta la ventana.")
-        return
+        dfw = df_live.tail(300).copy()
+        st.info("La ventana seleccionada dejó el conjunto vacío. Se muestran los últimos 300 registros.")
+
+    dfw = limit_live_df(dfw)
 
     show_kpis(dfw, "Live", freq)
 
+    with st.expander("Nube de conceptos", expanded=True):
+        texts_wc = dfw.sort_values("date", ascending=False)["text"].head(MAX_WC_DOCS).astype(str).tolist()
+        wc_text = join_text_for_wc(texts_wc)
+        fig = plot_wordcloud_from_text(wc_text)
+        if fig is not None:
+            st.pyplot(fig)
+            plt.close(fig)  # libera memoria
+        else:
+            st.info("No hay datos suficientes para generar nube de palabras.")
+
     n_periods = period_count(dfw, freq)
 
-    # Si no hay suficiente historia para tendencias: mostrar actividad SIEMPRE
-    if n_periods <= 1:
+    # Fallback: actividad
+    if n_periods < 2:
         st.info(
-            "Modo Live: solo se detecto un periodo temporal. "
-            "Se mostrara actividad (frecuencias y articulos recientes). "
-            "La clasificacion de tendencia se habilita automaticamente con 2 o mas periodos."
+            f"Modo actividad. Periodos detectados: {n_periods}. "
+            "Se requieren al menos 2 periodos para calcular tendencias."
         )
 
-        try:
-            activity = compute_live_activity(dfw, ngram_max=int(ngram_max), min_df=int(min_df))
-        except Exception as e:
-            st.error(f"No se pudo calcular actividad Live: {e}")
-            st.dataframe(dfw.sort_values("date", ascending=False).head(30), use_container_width=True)
-            return
-
-        left, right = st.columns([1.15, 1])
+        res = compute_live_activity(dfw, ngram_max, min_df)
+        left, right = st.columns(2)
 
         with left:
-            st.subheader("Top terminos recientes")
-            if activity.top_terms.empty:
-                st.info("No se encontraron terminos con los parametros actuales.")
+            st.subheader("Términos más activos")
+            if res.top_terms.empty:
+                st.info("No hay términos detectables. Baja min_df o cambia ngram_max.")
             else:
-                st.dataframe(activity.top_terms, use_container_width=True, height=420)
+                st.dataframe(
+                    res.top_terms,
+                    use_container_width=True,
+                    column_config={
+                        "score": st.column_config.ProgressColumn(
+                            "Relevancia (TF-IDF)",
+                            format="%.2f",
+                            min_value=0,
+                            max_value=float(res.top_terms["score"].max()),
+                        )
+                    },
+                )
 
         with right:
-            st.subheader("Actividad por dia")
-            if activity.activity_by_day.empty:
-                st.info("No hay suficientes puntos para graficar actividad.")
+            st.subheader("Actividad por día")
+            if res.activity_by_day.empty:
+                st.info("No hay actividad agregable.")
             else:
-                st.line_chart(activity.activity_by_day.set_index("day")[["items"]], use_container_width=True)
+                st.bar_chart(res.activity_by_day.set_index("day"), use_container_width=True)
 
-        st.subheader("Articulos recientes")
-        st.dataframe(activity.recent_rows, use_container_width=True, height=380)
+        st.subheader("Documentos recientes")
+        st.dataframe(res.recent_rows, use_container_width=True)
         return
 
-    # Si hay 2+ periodos: construir conteos por periodo y clasificar tendencia (simple y robusto)
-    st.success("Se detecto historia suficiente. Se calcularan tendencias Live.")
+    # Tendencias: clasificación heurística
+    st.success(f"Modo tendencias. Historia suficiente: {n_periods} periodos.")
 
-    # Construir serie por termino/periodo usando TF-IDF para seleccionar terminos
+    vec = TfidfVectorizer(
+        stop_words="english",
+        ngram_range=(1, int(ngram_max)),
+        max_features=MAX_FEATURES_TRENDS,
+        min_df=int(min_df),
+    )
+
     try:
-        vec = TfidfVectorizer(
-            lowercase=True,
-            stop_words=None,
-            max_features=5000,
-            ngram_range=(1, int(ngram_max)),
-            token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_\-]+\b",
-            min_df=int(min_df),
-        )
-        X = vec.fit_transform(dfw["text"].values)
-        terms = vec.get_feature_names_out()
+        X = vec.fit_transform(dfw["text"])
         scores = X.sum(axis=0).A1
-        if len(scores) == 0:
-            st.info("No hay terminos suficientes con los parametros actuales. Baja min_df o cambia ngram_max.")
+        terms = vec.get_feature_names_out()
+
+        cand = (
+            pd.DataFrame({"term": terms, "score": scores})
+            .sort_values("score", ascending=False)
+            .head(TOPK_CANDIDATES)
+            .reset_index(drop=True)
+        )
+
+        if cand.empty:
+            st.info("No se detectaron candidatos. Ajusta min_df o ngram_max.")
             return
-        top_k = 60
-        top_idx = scores.argsort()[::-1][:top_k]
-        top_terms = terms[top_idx].tolist()
-    except Exception as e:
-        st.error(f"No se pudieron construir terminos Live: {e}")
-        return
 
-    # Tokenizacion ligera por conteo de ocurrencias: para robustez, aproximamos con presencia por documento.
-    # Si quieres conteo exacto, se puede extender; este enfoque es estable y rapido.
-    dfw = dfw.copy()
-    dfw["period"] = dfw["date"].dt.to_period(freq).astype(str)
+        mat = build_term_timeseries_cached(dfw, freq, tuple(cand["term"].tolist()))
+        if mat.empty or mat.shape[0] < 2:
+            st.info("No hay suficientes periodos para construir series temporales.")
+            return
 
-    # Conteo por termino/periodo (presencia por documento)
-    rows = []
-    text_series = dfw["text"].str.lower()
+        cls = classify_trends_from_matrix_cached(mat)
+        if cls.empty:
+            st.info("No se pudo clasificar ningún término.")
+            return
 
-    for term in top_terms:
-        # busqueda simple. Para bigramas, el termino incluye espacio
-        mask = text_series.str.contains(term, regex=False)
-        if mask.sum() == 0:
-            continue
-        tmp = dfw.loc[mask, ["period"]].copy()
-        cnt = tmp.groupby("period").size().rename("count").reset_index()
-        cnt["term"] = term
-        rows.append(cnt)
+        st.subheader("Clasificación Live")
+        tabs = st.tabs(["Emergente", "Consolidada", "Declive", "Otros"])
 
-    if not rows:
-        st.info("No se generaron series. Prueba con ngram_max=1 y min_df=1.")
-        return
+        def render_class(tab, label_name: str, sort_mode: str):
+            with tab:
+                sub = cls[cls["label"] == label_name].copy()
+                if sub.empty:
+                    st.info(f"No hay elementos en {label_name}.")
+                    return
 
-    trend_df = pd.concat(rows, ignore_index=True)
-    trend_df = trend_df.sort_values(["term", "period"]).reset_index(drop=True)
+                if sort_mode == "slope":
+                    sub = sub.sort_values(["slope", "total"], ascending=[False, False])
+                else:
+                    sub = sub.sort_values(["total", "stability"], ascending=[False, False])
 
-    # Completar periodos faltantes por termino con 0
-    all_periods = sorted(trend_df["period"].unique().tolist())
-    full = []
-    for term in sorted(trend_df["term"].unique().tolist()):
-        sub = trend_df[trend_df["term"] == term].set_index("period")
-        sub = sub.reindex(all_periods, fill_value=0)
-        sub = sub.reset_index().rename(columns={"index": "period"})
-        sub["term"] = term
-        full.append(sub)
+                st.dataframe(
+                    sub[["term", "total", "slope", "growth", "stability"]],
+                    use_container_width=True,
+                    column_config={
+                        "term": "Término",
+                        "total": "Total",
+                        "slope": st.column_config.NumberColumn("Pendiente", format="%.3f"),
+                        "growth": st.column_config.NumberColumn("Crecimiento", format="%.2f"),
+                        "stability": st.column_config.NumberColumn("Estabilidad", format="%.2f"),
+                    },
+                )
 
-    trend_df = pd.concat(full, ignore_index=True)
-    trend_df["count"] = trend_df["count"].astype(int)
+                top_terms = sub["term"].head(50).tolist()
+                selected = st.selectbox("Selecciona un término", top_terms, key=f"live_sel_{label_name}")
 
-    # Clasificacion simple por pendiente sobre los ultimos N puntos
-    # emergente: pendiente positiva marcada
-    # declive: pendiente negativa marcada
-    # consolidada: estable
-    def classify(series: pd.Series) -> str:
-        y = series.values.astype(float)
-        if len(y) < 2:
-            return "actividad"
-        # Pendiente con regresion lineal simple
-        x = pd.Series(range(len(y))).values.astype(float)
-        x_mean = x.mean()
-        y_mean = y.mean()
-        denom = ((x - x_mean) ** 2).sum()
-        if denom == 0:
-            return "consolidada"
-        slope = ((x - x_mean) * (y - y_mean)).sum() / denom
+                series = mat[selected].reset_index().rename(columns={selected: "items"})
+                st.line_chart(series.set_index("period")["items"], use_container_width=True)
 
-        # Normalizar por magnitud
-        scale = max(1.0, y.max())
-        slope_n = slope / scale
+        render_class(tabs[0], "emergente", "slope")
+        render_class(tabs[1], "consolidada", "total")
+        render_class(tabs[2], "declive", "slope")
 
-        if slope_n >= 0.08:
-            return "emergente"
-        if slope_n <= -0.08:
-            return "declive"
-        return "consolidada"
-
-    classes = []
-    for term in sorted(trend_df["term"].unique().tolist()):
-        sub = trend_df[trend_df["term"] == term].sort_values("period")
-        cls = classify(sub["count"])
-        classes.append({"term": term, "class": cls})
-
-    classes_df = pd.DataFrame(classes)
-    trend_df = trend_df.merge(classes_df, on="term", how="left")
-
-    # Tabs por clase
-    classes_order = ["emergente", "consolidada", "declive"]
-    tabs = st.tabs([c.capitalize() for c in classes_order])
-
-    for cls, tab in zip(classes_order, tabs):
-        with tab:
-            sub = trend_df[trend_df["class"] == cls].copy()
+        with tabs[3]:
+            sub = cls[cls["label"] == "otro"].copy()
             if sub.empty:
-                st.info("No hay terminos en esta categoria con los parametros actuales.")
-                continue
+                st.info("No hay elementos en otros.")
+            else:
+                st.dataframe(sub[["term", "total", "slope", "growth", "stability"]].head(80), use_container_width=True)
 
-            # Ranking por volumen total
-            ranking = (
-                sub.groupby("term", as_index=False)["count"].sum()
-                .sort_values("count", ascending=False)
-                .head(200)
+        with st.expander("Criterios de clasificación"):
+            st.write(
+                "Se generan candidatos por TF-IDF y se construye una serie temporal (conteos por periodo). "
+                "Pendiente: regresión lineal sobre conteos. Crecimiento: último vs primero. "
+                "Estabilidad: variación normalizada. "
+                "Emergente: pendiente alta y crecimiento positivo. Declive: pendiente negativa y crecimiento negativo. "
+                "Consolidada: alta presencia, estable y pendiente cercana a cero."
             )
-            term = st.selectbox("Selecciona un termino", ranking["term"].tolist(), key=f"live_term_{cls}")
 
-            ts = sub[sub["term"] == term].sort_values("period")
-            st.line_chart(ts.set_index("period")[["count"]], use_container_width=True)
-
-            c1, c2 = st.columns([1.2, 1])
-            with c1:
-                st.dataframe(ts[["period", "count"]], use_container_width=True, height=360)
-            with c2:
-                st.write("Resumen")
-                st.metric("Total apariciones (presencia)", f"{ts['count'].sum():,}")
-                st.metric("Periodos", f"{len(ts):,}")
+    except Exception as e:
+        st.error(f"Error en clasificación Live: {e}")
 
 
 # -----------------------------
-# Main App
+# Main
 # -----------------------------
-def main() -> None:
+def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    apply_dark_css()
+    apply_custom_css()
 
-    controls = live_controls()
-    auto_refresh = int(controls["auto_refresh"])
-    do_update = bool(controls["do_update"])
+    st.title(APP_TITLE)
 
-    header()
-    quick_guide()
+    mode = st.radio("Modo", ["Histórico (MIT)", "Live (Tiempo real)"], horizontal=True)
 
-    # Auto-refresh (opcional)
-    if auto_refresh > 0:
-        maybe_autorefresh(auto_refresh)
-
-    st.markdown("### Modo de datos")
-    mode = st.radio("Selecciona el modo", ["Historico (MIT)", "Live (RSS + arXiv)"], horizontal=True)
-
-    if mode == "Live (RSS + arXiv)":
-        if do_update:
-            run_live_update()
-            st.rerun()
+    if "Live" in mode:
         live_view()
     else:
         historic_view()
 
 
 if __name__ == "__main__":
-    # Asegura encoding UTF-8 en Windows cuando sea posible
-    try:
-        os.environ["PYTHONIOENCODING"] = "utf-8"
-    except Exception:
-        pass
+    os.environ["PYTHONIOENCODING"] = "utf-8"
     main()
