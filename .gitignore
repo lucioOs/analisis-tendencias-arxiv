@@ -1,0 +1,38 @@
+# Entornos virtuales
+venv/
+.env
+
+# Datos generados (NO subir)
+data/processed/*.parquet
+data/raw/*.parquet
+data/processed/*.csv
+data/raw/*.csv
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
+
+# datasets y outputs
+data/raw/
+data/processed/
+
+# si quieres conservar la carpeta pero no los archivos:
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# caches/entornos
+.venv/
+venv/
+__pycache__/
+*.pyc
+.streamlit/
+
+# datasets / outputs
+data/raw/*
+data/processed/*
+!.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep

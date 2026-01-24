@@ -1,0 +1,17 @@
+{
+  "source": "data\\processed\\trends.parquet",
+  "rows": 24052,
+  "periods": 496,
+  "terms": 5189,
+  "areas": [
+    "Artificial Intelligence & Data Science",
+    "Cybersecurity",
+    "Databases & Information Retrieval",
+    "Hardware & Embedded Systems",
+    "Networking & IoT",
+    "Operating Systems & Computer Architecture",
+    "Software Engineering & Cloud",
+    "Uncategorized"
+  ],
+  "top_terms_per_area_period": 25
+}
