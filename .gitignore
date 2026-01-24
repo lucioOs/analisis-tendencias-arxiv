@@ -1,38 +1,156 @@
-# Entornos virtuales
-venv/
-.env
-
-# Datos generados (NO subir)
-data/processed/*.parquet
-data/raw/*.parquet
-data/processed/*.csv
-data/raw/*.csv
-
-# Cache Python
+########################################
+# Python general
+########################################
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.pytype/
+ruff_cache/
 
+########################################
+# Entornos virtuales
+########################################
+venv/
+.venv/
+env/
+ENV/
+.env
+.env.*
+
+########################################
+# Paquetes / builds
+########################################
+build/
+dist/
+*.egg-info/
+.eggs/
+
+########################################
+# Jupyter / notebooks
+########################################
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+########################################
 # Streamlit
+########################################
 .streamlit/
+streamlit.log
 
-# datasets y outputs
+########################################
+# Logs y temporales
+########################################
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+########################################
+# Datos (CRÍTICO: no subir datasets)
+########################################
+data/
+data_raw/
 data/raw/
 data/processed/
+data/interim/
 
-# si quieres conservar la carpeta pero no los archivos:
-!data/raw/.gitkeep
-!data/processed/.gitkeep
+data_public/
+data_public/**
 
-# caches/entornos
-.venv/
-venv/
-__pycache__/
-*.pyc
-.streamlit/
+*.parquet
+*.csv
+*.tsv
+*.json
+*.pkl
+*.pickle
+*.joblib
+*.npz
+*.h5
+*.hdf5
 
-# datasets / outputs
-data/raw/*
-data/processed/*
-!.gitkeep
-!data/raw/.gitkeep
-!data/processed/.gitkeep
+########################################
+# Modelos entrenados
+########################################
+models/
+models/**
+*.pt
+*.pth
+*.onnx
+*.sav
+
+########################################
+# Resultados / exportaciones
+########################################
+outputs/
+exports/
+reports/
+figures/
+plots/
+results/
+
+########################################
+# Configuración local / credenciales
+########################################
+config.local.py
+settings.local.json
+secrets.toml
+credentials.json
+*.key
+*.pem
+
+########################################
+# Git
+########################################
+.gitignore.bak
+.rc
+.rc.local
+
+########################################
+# SO: Windows
+########################################
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+########################################
+# SO: macOS
+########################################
+.DS_Store
+.AppleDouble
+.LSOverride
+
+########################################
+# SO: Linux
+########################################
+*~
+.nfs*
+
+########################################
+# IDEs / editores
+########################################
+.vscode/
+.idea/
+.spyderproject
+.spyproject
+*.swp
+*.swo
+
+########################################
+# Docker (si se usa local)
+########################################
+docker-compose.override.yml
+
+########################################
+# Archivos grandes accidentales
+########################################
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.rar
