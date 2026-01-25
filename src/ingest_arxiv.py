@@ -2,38 +2,62 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
-import certifi
-import feedparser
+import feedparser  # type: ignore
 import pandas as pd
 import requests
 
-PROCESSED = Path("data/processed")
-PROCESSED.mkdir(parents=True, exist_ok=True)
+# =============================================================================
+# Configuración Global
+# =============================================================================
+PROCESSED_DIR = Path("data/processed")
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+# User-Agent claro (recomendado por arXiv para clientes)
+USER_AGENT = "PredicTrends/1.0 (mailto:tu_email@dominio.com)"
+
+# Rate limit “polite” (arXiv suele recomendar no bombardear; 3+ s es razonable)
+POLITE_SLEEP_SEC = 3.1
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
-# -----------------------------
-# Helpers de fecha / texto
-# -----------------------------
-def _parse_struct_time(st) -> Optional[datetime]:
+# =============================================================================
+# Helpers: Fechas y Texto
+# =============================================================================
+def _parse_struct_time(st: Any) -> Optional[datetime]:
+    """Convierte struct_time de feedparser a datetime UTC aware."""
     if not st:
         return None
     try:
         return datetime(
-            st.tm_year, st.tm_mon, st.tm_mday,
-            st.tm_hour, st.tm_min, st.tm_sec,
+            st.tm_year,
+            st.tm_mon,
+            st.tm_mday,
+            st.tm_hour,
+            st.tm_min,
+            st.tm_sec,
             tzinfo=timezone.utc,
         )
     except Exception:
         return None
 
-def pick_entry_datetime(entry: Any) -> datetime:
+
+def get_entry_date(entry: Any) -> datetime:
+    """Extrae fecha: published -> updated -> now(UTC)."""
     dt = _parse_struct_time(getattr(entry, "published_parsed", None))
     if dt is None:
         dt = _parse_struct_time(getattr(entry, "updated_parsed", None))
@@ -41,312 +65,275 @@ def pick_entry_datetime(entry: Any) -> datetime:
         dt = datetime.now(timezone.utc)
     return dt
 
-def normalize_text(s: str) -> str:
-    s = str(s or "").replace("\n", " ").replace("\r", " ")
+
+def normalize_text(text: Any) -> str:
+    """Limpia espacios, saltos de línea y nulos."""
+    s = str(text or "")
+    s = s.replace("\n", " ").replace("\r", " ")
     s = " ".join(s.split())
     return s.strip()
 
-def _to_naive_utc(dt_aware: datetime) -> datetime:
-    # dt_aware está en UTC; lo guardamos naive para consistencia con el resto del proyecto
-    return dt_aware.astimezone(timezone.utc).replace(tzinfo=None)
 
-def _safe_str(x: Any) -> str:
+def _save_atomic_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Guarda el DataFrame de forma atómica (tmp -> rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
     try:
-        return str(x) if x is not None else ""
-    except Exception:
-        return ""
+        df.to_parquet(tmp_path, index=False)
+        os.replace(tmp_path, path)
+        logger.info("Guardado seguro en: %s", path)
+    except Exception as e:
+        logger.error("Error guardando parquet: %s", e)
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        raise
 
 
-# -----------------------------
-# Fetch
-# -----------------------------
-@dataclass
+# =============================================================================
+# Clase de Respuesta
+# =============================================================================
+@dataclass(frozen=True)
 class FetchResult:
     df: pd.DataFrame
-    page_min_dt_utc: Optional[datetime]  # el más viejo de la página (aware UTC)
+    min_date_utc: Optional[datetime]  # Fecha más antigua (min) en la página
 
-def fetch_arxiv_page(
+
+# =============================================================================
+# Lógica de Extracción (Extract)
+# =============================================================================
+def fetch_page(
     session: requests.Session,
     query: str,
     start: int,
     max_results: int,
-    timeout: int = 30,
-    retries: int = 3,
-    backoff_sec: float = 1.5,
-    debug: bool = False,
+    retries: int,
+    backoff: float,
+    timeout: int,
 ) -> FetchResult:
-    """
-    Descarga una página del API de arXiv y devuelve dataframe + fecha mínima de la página.
-    """
-    base = "https://export.arxiv.org/api/query"
+    """Descarga y parsea una página del API de arXiv."""
+    url = "https://export.arxiv.org/api/query"
     params = {
         "search_query": query,
-        "start": start,
-        "max_results": max_results,
+        "start": int(start),
+        "max_results": int(max_results),
         "sortBy": "submittedDate",
         "sortOrder": "descending",
     }
-    headers = {"User-Agent": "TrendsDashboard/1.0 (contact: local)"}
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/atom+xml,application/xml,text/xml,*/*",
+    }
 
     last_err: Optional[Exception] = None
 
     for attempt in range(1, retries + 1):
         try:
-            r = session.get(
-                base,
-                params=params,
-                headers=headers,
-                timeout=timeout,
-                verify=certifi.where(),
-            )
-            r.raise_for_status()
+            resp = session.get(url, params=params, headers=headers, timeout=timeout)
+            resp.raise_for_status()
 
-            feed = feedparser.parse(r.text)
-
-            # feedparser puede marcar "bozo" cuando hay algo raro en XML, pero a veces igual hay data útil.
-            if getattr(feed, "bozo", 0) and debug:
-                exc = getattr(feed, "bozo_exception", None)
-                print(f"[DEBUG] feed.bozo=1 start={start} exc={exc}")
-
-            entries = getattr(feed, "entries", None) or []
+            feed = feedparser.parse(resp.text)
+            entries = getattr(feed, "entries", []) or []
             if not entries:
-                return FetchResult(df=pd.DataFrame(), page_min_dt_utc=None)
+                return FetchResult(pd.DataFrame(), None)
 
-            rows = []
-            dts: list[datetime] = []
+            rows: list[dict] = []
+            min_dt: Optional[datetime] = None
 
-            for e in entries:
-                dt = pick_entry_datetime(e)  # aware UTC
-                dts.append(dt)
+            for entry in entries:
+                dt_utc = get_entry_date(entry)
+                if min_dt is None or dt_utc < min_dt:
+                    min_dt = dt_utc
 
-                title = normalize_text(getattr(e, "title", ""))
-                summary = normalize_text(getattr(e, "summary", ""))
-                text = (title + ". " + summary).strip()
+                title = normalize_text(getattr(entry, "title", ""))
+                summary = normalize_text(getattr(entry, "summary", ""))
+
+                link = normalize_text(getattr(entry, "link", ""))
+                raw_id = normalize_text(getattr(entry, "id", ""))
+
+                # id típico: http://arxiv.org/abs/XXXX.XXXXXvY
+                clean_id = raw_id.split("/")[-1] if raw_id else (link or f"{title[:30]}|{dt_utc.isoformat()}")
+
+                # categorías desde tags
+                tags = getattr(entry, "tags", []) or []
+                cat_terms = []
+                for t in tags:
+                    term = normalize_text(getattr(t, "term", ""))
+                    if term:
+                        cat_terms.append(term)
+                categories = ",".join(sorted(set(cat_terms)))
 
                 rows.append(
                     {
-                        "date": dt.isoformat(),
-                        "text": text,
-                        "source": "arxiv",
-                        "id": getattr(e, "id", None),
+                        "date": dt_utc,  # UTC aware
                         "title": title,
-                        "url": getattr(e, "link", None),
+                        "abstract": summary,
+                        "text": f"{title}. {summary}".strip(),
+                        "categories": categories,
+                        "link": link,
+                        "id": clean_id,
+                        "source": "arxiv_api",
                     }
                 )
 
             df = pd.DataFrame(rows)
-            page_min_dt = min(dts) if dts else None
-            return FetchResult(df=df, page_min_dt_utc=page_min_dt)
+            return FetchResult(df, min_dt)
 
         except Exception as e:
             last_err = e
             if attempt < retries:
-                # backoff + jitter (evita choques si arXiv rate-limitea)
-                jitter = random.random() * 0.25
-                time.sleep(backoff_sec * attempt + jitter)
+                wait = backoff * (2 ** (attempt - 1)) + (random.random() * 0.5)
+                logger.warning(
+                    "Error en página start=%s (intento %s/%s). Reintentando en %.1fs... Error: %s",
+                    start,
+                    attempt,
+                    retries,
+                    wait,
+                    e,
+                )
+                time.sleep(wait)
             else:
-                raise RuntimeError(f"Error consultando arXiv (start={start}): {e}") from e
+                logger.error("Fallo definitivo en página start=%s: %s", start, e)
+                raise
 
-    raise RuntimeError(f"Error consultando arXiv: {last_err}")
-
-
-# -----------------------------
-# Dedup / filtro / merge
-# -----------------------------
-def dedup_robusto(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    if "id" in df.columns and df["id"].notna().any():
-        df = df.drop_duplicates(subset=["id"], keep="last")
-    elif "url" in df.columns and df["url"].notna().any():
-        df = df.drop_duplicates(subset=["url"], keep="last")
-    else:
-        df = df.drop_duplicates(subset=["text"], keep="last")
-
-    return df
-
-def parse_and_filter(df: pd.DataFrame, cutoff_utc_aware: datetime) -> pd.DataFrame:
-    """
-    - parse date
-    - limpia texto
-    - filtra por cutoff (window_days)
-    - guarda date naive
-    """
-    if df.empty:
-        return df
-
-    df = df.copy()
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-    df = df.dropna(subset=["date", "text"])
-
-    df["text"] = df["text"].astype(str).map(normalize_text)
-    df = df[df["text"].str.len() >= 20]
-
-    # a naive
-    df["date"] = df["date"].dt.tz_convert(None)
-
-    cutoff_naive = _to_naive_utc(cutoff_utc_aware)
-    df = df[df["date"] >= cutoff_naive]
-
-    return df
-
-def _normalize_prev(prev: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza el parquet previo para que merge no reviente.
-    """
-    if prev is None or prev.empty:
-        return pd.DataFrame()
-
-    prev = prev.copy()
-
-    if "date" in prev.columns:
-        prev["date"] = pd.to_datetime(prev["date"], errors="coerce", utc=True).dt.tz_convert(None)
-    else:
-        prev["date"] = pd.NaT
-
-    if "text" in prev.columns:
-        prev["text"] = prev["text"].astype(str).map(normalize_text)
-    else:
-        prev["text"] = ""
-
-    if "source" not in prev.columns:
-        prev["source"] = "arxiv"
-
-    for col in ["id", "title", "url"]:
-        if col not in prev.columns:
-            prev[col] = None
-
-    prev = prev.dropna(subset=["date"])
-    prev = prev[prev["text"].str.len() >= 20]
-    return prev[["date", "text", "source", "id", "title", "url"]]
+    # no debería llegar aquí
+    raise RuntimeError(f"Fallo fetch_page start={start}: {last_err}")
 
 
-def _stats(df: pd.DataFrame) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp], int]:
-    if df.empty:
-        return None, None, 0
-    try:
-        mn = df["date"].min()
-        mx = df["date"].max()
-        unique_days = df["date"].dt.date.nunique()
-        return mn, mx, int(unique_days)
-    except Exception:
-        return None, None, 0
+# =============================================================================
+# Lógica Principal (Main Loop)
+# =============================================================================
+def run_ingestion(
+    query: str,
+    output_file: Path,
+    window_days: int,
+    page_size: int,
+    max_pages: int,
+    incremental: bool,
+) -> None:
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=int(window_days))
+    logger.info("Iniciando ingesta. Ventana=%s días | Cutoff=%s", window_days, cutoff_date.isoformat())
 
-
-# -----------------------------
-# Main
-# -----------------------------
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Ingesta arXiv con auto-cutoff (paginado hasta window_days).")
-    ap.add_argument("--query", required=True, help='Ej: "cat:cs.AI OR cat:cs.LG OR cat:cs.CL"')
-    ap.add_argument("--window_days", type=int, default=180, help="Ventana hacia atrás (días)")
-    ap.add_argument("--page_size", type=int, default=100, help="Tamaño por página")
-    ap.add_argument("--max_pages", type=int, default=200, help="Límite de seguridad de páginas (evita loops)")
-    ap.add_argument("--timeout", type=int, default=30, help="Timeout HTTP (seg)")
-    ap.add_argument("--retries", type=int, default=3, help="Reintentos por página")
-    ap.add_argument("--backoff", type=float, default=1.5, help="Backoff base (seg)")
-    ap.add_argument("--polite_sleep", type=float, default=0.25, help="Pausa entre páginas (seg) para ser amable con arXiv")
-    ap.add_argument("--out", default=str(PROCESSED / "live_arxiv.parquet"), help="Salida parquet")
-    ap.add_argument("--incremental", action="store_true", help="Si existe el parquet, lo mezcla (no pierdes historia).")
-    ap.add_argument("--debug", action="store_true", help="Logs extra para diagnóstico.")
-    args = ap.parse_args()
-
-    window_days = max(1, int(args.window_days))
-    page_size = max(1, int(args.page_size))
-    max_pages = max(1, int(args.max_pages))
-
-    cutoff_utc = datetime.now(timezone.utc) - timedelta(days=window_days)
-
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Cargar previo si incremental
-    prev = pd.DataFrame()
-    if args.incremental and out_path.exists():
+    # Carga incremental
+    existing_df = pd.DataFrame()
+    if incremental and output_file.exists():
         try:
-            prev = pd.read_parquet(out_path)
-            prev = _normalize_prev(prev)
-        except Exception:
-            prev = pd.DataFrame()
+            existing_df = pd.read_parquet(output_file)
+            if "date" in existing_df.columns:
+                existing_df["date"] = pd.to_datetime(existing_df["date"], utc=True, errors="coerce")
+            logger.info("Cargados %s registros previos.", len(existing_df))
+        except Exception as e:
+            logger.warning("No se pudo leer archivo previo %s; se iniciará de cero. Error: %s", output_file, e)
+            existing_df = pd.DataFrame()
 
     session = requests.Session()
-
-    all_parts = []
+    new_frames: list[pd.DataFrame] = []
     start = 0
-    pages_used = 0
+    pages_processed = 0
     reached_cutoff = False
 
-    t0 = time.time()
+    for _ in range(int(max_pages)):
+        pages_processed += 1
 
-    for _ in range(max_pages):
-        pages_used += 1
-
-        res = fetch_arxiv_page(
+        result = fetch_page(
             session=session,
-            query=args.query,
+            query=query,
             start=start,
-            max_results=page_size,
-            timeout=int(args.timeout),
-            retries=int(args.retries),
-            backoff_sec=float(args.backoff),
-            debug=bool(args.debug),
+            max_results=int(page_size),
+            retries=3,
+            backoff=2.0,
+            timeout=30,
         )
 
-        dfp = res.df
-        if dfp.empty:
-            # no hay más resultados
+        if result.df.empty:
+            logger.info("La API no devolvió más resultados.")
             break
 
-        dfp2 = parse_and_filter(dfp, cutoff_utc_aware=cutoff_utc)
-        if not dfp2.empty:
-            all_parts.append(dfp2)
+        # Normaliza dates del batch
+        batch = result.df.copy()
+        batch["date"] = pd.to_datetime(batch["date"], utc=True, errors="coerce")
+        batch = batch.dropna(subset=["date"]).reset_index(drop=True)
 
-        # condición de parada: esta página ya tiene elementos más viejos que cutoff
-        if res.page_min_dt_utc is not None and res.page_min_dt_utc < cutoff_utc:
+        # Filtra por cutoff para ahorrar memoria
+        batch_cut = batch[batch["date"] >= cutoff_date]
+        if not batch_cut.empty:
+            new_frames.append(batch_cut)
+
+        # Si la página ya cruzó el cutoff, detener
+        if result.min_date_utc is not None and result.min_date_utc < cutoff_date:
+            logger.info("Alcanzada fecha de corte (%s < %s). Deteniendo.", result.min_date_utc, cutoff_date)
             reached_cutoff = True
             break
 
-        start += page_size
-        time.sleep(max(0.0, float(args.polite_sleep)))
+        start += int(page_size)
+        time.sleep(POLITE_SLEEP_SEC)
 
-    df_new = pd.concat(all_parts, ignore_index=True) if all_parts else pd.DataFrame()
+    if not reached_cutoff and pages_processed >= int(max_pages):
+        logger.warning("Se alcanzó max_pages=%s sin llegar al cutoff. Considera subir max_pages o max_total.", max_pages)
 
-    if df_new.empty and prev.empty:
-        print("[WARN] arXiv: sin datos (nuevo y previo vacío).")
+    if not new_frames and existing_df.empty:
+        logger.warning("No hay datos para guardar.")
         return
 
-    # Merge incremental
-    if not prev.empty:
-        df = pd.concat([prev, df_new], ignore_index=True)
-    else:
-        df = df_new
+    new_df = pd.concat(new_frames, ignore_index=True) if new_frames else pd.DataFrame()
+    logger.info("Nuevos registros obtenidos (tras cutoff): %s", len(new_df))
 
-    # Limpieza final + dedup
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=False)
-    df = df.dropna(subset=["date", "text"])
-    df["text"] = df["text"].astype(str).map(normalize_text)
+    # Merge
+    frames = []
+    if existing_df is not None and not existing_df.empty:
+        frames.append(existing_df.dropna(axis=1, how="all"))
+    if new_df is not None and not new_df.empty:
+        frames.append(new_df.dropna(axis=1, how="all"))
 
-    # Recortar a ventana (evita crecimiento infinito si incremental)
-    cutoff_naive = _to_naive_utc(cutoff_utc)
-    df = df[df["date"] >= cutoff_naive]
+    full_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-    df = dedup_robusto(df)
-    df = df.sort_values("date").reset_index(drop=True)
+    # Limpieza final
+    full_df["date"] = pd.to_datetime(full_df["date"], utc=True, errors="coerce")
+    full_df = full_df.dropna(subset=["date"])
+    full_df = full_df[full_df["date"] >= cutoff_date]
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(out_path, index=False)
+    # Deduplicación (id -> link -> title+date)
+    before = len(full_df)
+    full_df = full_df.sort_values("date", ascending=True)
 
-    mn, mx, unique_days = _stats(df)
-    dt = time.time() - t0
+    if "id" in full_df.columns:
+        full_df = full_df.drop_duplicates(subset=["id"], keep="last")
+    if "link" in full_df.columns:
+        full_df = full_df.drop_duplicates(subset=["link"], keep="last")
+    if {"title", "date"}.issubset(full_df.columns):
+        full_df = full_df.drop_duplicates(subset=["title", "date"], keep="last")
 
-    print(
-        f"[INFO] Exportado: {out_path} | rows={len(df)} | "
-        f"min={mn} | max={mx} | unique_days={unique_days} | "
-        f"pages_used={pages_used} | reached_cutoff={reached_cutoff} | "
-        f"elapsed_sec={dt:.1f}"
+    logger.info("Deduplicación: %s -> %s filas.", before, len(full_df))
+
+    # Guardado: UTC naive (documentado)
+    full_df["date"] = full_df["date"].dt.tz_convert(None)
+
+    _save_atomic_parquet(full_df.reset_index(drop=True), output_file)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Ingesta profesional de arXiv (API oficial)")
+    parser.add_argument("--query", type=str, required=True, help="Query arXiv API (ej: 'cat:cs.AI')")
+    parser.add_argument("--window", type=int, default=30, help="Días de historia a mantener (default: 30)")
+    parser.add_argument("--output", type=str, default="data/processed/live_arxiv.parquet", help="Ruta parquet salida")
+    parser.add_argument("--full-refresh", action="store_true", help="Ignora archivo existente (no incremental)")
+    parser.add_argument("--page-size", type=int, default=100, help="Resultados por página (default: 100)")
+    parser.add_argument("--max-pages", type=int, default=300, help="Límite de páginas (default: 300)")
+
+    args = parser.parse_args()
+
+    run_ingestion(
+        query=args.query,
+        output_file=Path(args.output),
+        window_days=int(args.window),
+        page_size=int(args.page_size),
+        max_pages=int(args.max_pages),
+        incremental=not bool(args.full_refresh),
     )
 
 
